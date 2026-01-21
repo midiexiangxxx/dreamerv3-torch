@@ -355,7 +355,7 @@ def simulate_vec(
         step += num_envs
         episode += done.sum()
 
-    return (step, episode, done, length, obs_list, agent_state, reward, ep_buffers)
+    return (step - steps, episode - episodes, done, length, obs_list, agent_state, reward, ep_buffers)
 
 
 def add_to_buffer(buffer, obs, reward, discount, action=None):
