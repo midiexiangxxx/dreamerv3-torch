@@ -102,6 +102,9 @@ def rollout_with_viewer(agent, env, visual_env, max_steps=500, device='cuda:0'):
     done = np.array([False])
     agent_state = None
 
+    smooth_act = np.zeros_like(env.action_space.sample())
+    alpha = 0.8
+
     for step in range(max_steps):
         # 渲染可视化环境
         visual_env.render()
@@ -128,11 +131,12 @@ def rollout_with_viewer(agent, env, visual_env, max_steps=500, device='cuda:0'):
         else:
             act = action[0].detach().cpu().numpy()
 
+        smooth_act = alpha * smooth_act + (1 - alpha) * act
         # 执行动作
-        obs, reward, done, info = env.step(act)
+        obs, reward, done, info = env.step(smooth_act)
 
         # 同步可视化环境
-        act_tensor = torch.from_numpy(act).unsqueeze(0).to(visual_env.unwrapped.device)
+        act_tensor = torch.from_numpy(smooth_act).unsqueeze(0).to(visual_env.unwrapped.device)
         visual_env.step(act_tensor)
 
         total_reward += reward

@@ -21,8 +21,64 @@ import torch
 from torch import nn
 from torch import distributions as torchd
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 
 to_np = lambda x: x.detach().cpu().numpy()
+
+
+class WandbLogger:
+    """Logger wrapper that also logs to wandb"""
+    def __init__(self, base_logger, use_wandb=True):
+        self._base = base_logger
+        self._use_wandb = use_wandb
+        self._videos = {}  # 缓存视频用于 wandb
+
+    @property
+    def step(self):
+        return self._base.step
+
+    @step.setter
+    def step(self, value):
+        self._base.step = value
+
+    def scalar(self, name, value):
+        self._base.scalar(name, value)
+
+    def image(self, name, value):
+        self._base.image(name, value)
+
+    def video(self, name, value):
+        self._base.video(name, value)
+        if self._use_wandb:
+            self._videos[name] = value
+
+    def write(self, fps=False, step=False):
+        if self._use_wandb:
+            log_step = step if step else self._base.step
+            wandb_dict = {}
+            # 记录 scalars
+            if self._base._scalars:
+                wandb_dict.update(self._base._scalars)
+            # 记录 videos
+            for name, value in self._videos.items():
+                # value shape: (B, T, H, W, C)
+                if isinstance(value, np.ndarray):
+                    if np.issubdtype(value.dtype, np.floating):
+                        value = np.clip(255 * value, 0, 255).astype(np.uint8)
+                    # wandb.Video 需要 (T, H, W, C) 或 (T, C, H, W)
+                    # 如果有 batch 维度，取第一个
+                    if value.ndim == 5:
+                        value = value[0]  # (T, H, W, C)
+                    wandb_dict[name] = wandb.Video(value, fps=16, format="mp4")
+            if wandb_dict:
+                wandb.log(wandb_dict, step=log_step)
+            self._videos = {}
+        self._base.write(fps=fps, step=step)
 
 
 class Dreamer(nn.Module):
@@ -219,9 +275,27 @@ def main(config):
     logdir.mkdir(parents=True, exist_ok=True)
     config.traindir.mkdir(parents=True, exist_ok=True)
     config.evaldir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize wandb
+    use_wandb = getattr(config, 'wandb', False) and WANDB_AVAILABLE
+    if getattr(config, 'wandb', False) and not WANDB_AVAILABLE:
+        print("Warning: wandb not installed, skipping wandb logging")
+    if use_wandb:
+        wandb_name = getattr(config, 'wandb_name', None) or f"{config.task}_seed{config.seed}"
+        wandb.init(
+            project=getattr(config, 'wandb_project', 'dreamerv3'),
+            entity=getattr(config, 'wandb_entity', None),
+            name=wandb_name,
+            config=vars(config),
+            dir=str(logdir),
+            resume="allow",
+        )
+        print(f"Wandb initialized: {wandb.run.url}")
+
     step = count_steps(config.traindir)
     # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step)
+    base_logger = tools.Logger(logdir, config.action_repeat * step)
+    logger = WandbLogger(base_logger, use_wandb=use_wandb)
 
     print("Create envs.")
     if config.offline_traindir:
@@ -338,10 +412,19 @@ def main(config):
         except Exception:
             pass
 
+    if use_wandb:
+        wandb.finish()
+    print("Training complete!")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--configs", nargs="+")
+    # Wandb arguments (parsed early, before config loading)
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--wandb_project", type=str, default="dreamerv3", help="Wandb project name")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity")
+    parser.add_argument("--wandb_name", type=str, default=None, help="Wandb run name")
     args, remaining = parser.parse_known_args()
     yaml = yaml.YAML(typ="safe", pure=True)
     configs = yaml.load(
@@ -363,4 +446,10 @@ if __name__ == "__main__":
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):
         arg_type = tools.args_type(value)
         parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
-    main(parser.parse_args(remaining))
+    final_args = parser.parse_args(remaining)
+    # Add wandb args to config
+    final_args.wandb = args.wandb
+    final_args.wandb_project = args.wandb_project
+    final_args.wandb_entity = args.wandb_entity
+    final_args.wandb_name = args.wandb_name
+    main(final_args)

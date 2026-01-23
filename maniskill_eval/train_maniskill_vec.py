@@ -35,6 +35,7 @@ class WandbLogger:
     def __init__(self, base_logger, use_wandb=True):
         self._base = base_logger
         self._use_wandb = use_wandb and WANDB_AVAILABLE
+        self._videos = {}  # 缓存视频用于 wandb
 
     @property
     def step(self):
@@ -52,12 +53,30 @@ class WandbLogger:
 
     def video(self, name, value):
         self._base.video(name, value)
+        if self._use_wandb:
+            self._videos[name] = value
 
     def write(self, fps=False, step=False):
-        if self._use_wandb and self._base._scalars:
+        if self._use_wandb:
             log_step = step if step else self._base.step
-            wandb_dict = dict(self._base._scalars)
-            wandb.log(wandb_dict, step=log_step)
+            wandb_dict = {}
+            # 记录 scalars
+            if self._base._scalars:
+                wandb_dict.update(self._base._scalars)
+            # 记录 videos
+            for name, value in self._videos.items():
+                # value shape: (B, T, H, W, C)
+                if isinstance(value, np.ndarray):
+                    if np.issubdtype(value.dtype, np.floating):
+                        value = np.clip(255 * value, 0, 255).astype(np.uint8)
+                    # wandb.Video 需要 (T, H, W, C) 或 (T, C, H, W)
+                    # 如果有 batch 维度，取第一个
+                    if value.ndim == 5:
+                        value = value[0]  # (T, H, W, C)
+                    wandb_dict[name] = wandb.Video(value, fps=16, format="mp4")
+            if wandb_dict:
+                wandb.log(wandb_dict, step=log_step)
+            self._videos = {}
         self._base.write(fps=fps, step=step)
 
 
@@ -312,10 +331,11 @@ def simulate_vec(
                     if isinstance(success, np.ndarray):
                         success = success.item()
 
-                    prefix = 'eval_' if is_eval else ''
-                    logger.scalar(f'{prefix}episode_reward', ep_reward)
-                    logger.scalar(f'{prefix}episode_length', ep_length)
+                    prefix = 'eval_' if is_eval else 'train_'
+                    logger.scalar(f'{prefix}return', ep_reward)
+                    logger.scalar(f'{prefix}length', ep_length)
                     logger.scalar(f'{prefix}success', float(success))
+                    logger.scalar(f'{prefix}episodes', episode)
 
                     # 保存 episode
                     ep_id = env.get_episode_id(i)
@@ -419,18 +439,32 @@ def save_episode(cache, directory, episode, ep_id, limit=None):
 # Environment Creation
 # ============================================================================
 
-def make_vec_env(task, num_envs, img_size=64):
-    """创建 ManiSkill GPU 并行环境"""
+def make_vec_env(task, num_envs, img_size=64, sim_device=None, shader="minimal"):
+    """创建 ManiSkill GPU 并行环境
+
+    Args:
+        task: 任务名
+        num_envs: 并行环境数
+        img_size: 图像大小
+        sim_device: 模拟器运行的 GPU，如 "cuda:0"。None 则自动选择
+        shader: 着色器类型，"minimal" 省显存，"default" 功能完整
+    """
     import mani_skill.envs
 
-    env = gym.make(
-        task,
+    env_kwargs = dict(
         num_envs=num_envs,
         obs_mode="rgb+state",
         control_mode="pd_ee_delta_pose",
         render_mode="rgb_array",
         sensor_configs=dict(width=img_size, height=img_size),
+        sim_backend="physx_cuda",  # 使用 GPU 物理模拟
+        shader_dir=shader,  # "minimal" 省显存
     )
+
+    if sim_device is not None:
+        env_kwargs["device"] = sim_device
+
+    env = gym.make(task, **env_kwargs)
 
     return ManiSkillVecEnvWrapper(env, img_size=img_size)
 
@@ -456,6 +490,10 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=1000000)
     parser.add_argument("--num_envs", type=int, default=16, help="Number of parallel environments")
+    parser.add_argument("--img_size", type=int, default=64, help="Image size (smaller = less VRAM)")
+    parser.add_argument("--env_device", type=str, default=None, help="GPU for environments, e.g. 'cuda:0'. None=auto")
+    parser.add_argument("--model_device", type=str, default="cuda:0", help="GPU for model training")
+    parser.add_argument("--shader", type=str, default="minimal", choices=["default", "minimal"], help="Shader type. 'minimal' uses less VRAM")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="dreamerv3-maniskill")
     parser.add_argument("--wandb_entity", type=str, default=None)
@@ -484,9 +522,10 @@ def main():
         'steps': args.steps,
         'envs': args.num_envs,
         'prefill': min_prefill,
+        'device': args.model_device,  # 模型训练设备
 
         # 显存优化配置
-        'batch_size': 16,
+        'batch_size': 64,
         'batch_length': 64,
         'action_repeat': 1,  # ManiSkill 不需要 action repeat
 
@@ -494,6 +533,7 @@ def main():
         'eval_every': 10000,
         'eval_episode_num': 10,
         'log_every': 1000,
+        'video_pred_log': True,  # 启用视频预测日志
 
         # 网络配置
         'encoder': {
@@ -566,8 +606,14 @@ def main():
 
     # 创建向量化环境
     print(f"Creating {args.num_envs} parallel environments...")
-    train_env = make_vec_env(args.task, num_envs=args.num_envs, img_size=64)
-    eval_env = make_vec_env(args.task, num_envs=min(args.num_envs, 4), img_size=64)
+    print(f"  Env device: {args.env_device or 'auto'}")
+    print(f"  Model device: {args.model_device}")
+    print(f"  Image size: {args.img_size}")
+    print(f"  Shader: {args.shader}")
+    train_env = make_vec_env(args.task, num_envs=args.num_envs, img_size=args.img_size,
+                             sim_device=args.env_device, shader=args.shader)
+    eval_env = make_vec_env(args.task, num_envs=min(args.num_envs, 4), img_size=args.img_size,
+                            sim_device=args.env_device, shader=args.shader)
 
     print(f"Train env: {args.num_envs} parallel envs")
     print(f"Eval env: {eval_env.num_envs} parallel envs")
@@ -654,6 +700,10 @@ def main():
         agent._should_pretrain._once = False
         print("Loaded checkpoint")
 
+    # 辅助函数：将 numpy 转为 torch tensor 用于 video_pred
+    def to_np(x):
+        return x.detach().cpu().numpy()
+
     # 主训练循环
     print("Starting training...")
     while agent._step < config['steps'] + config['eval_every']:
@@ -672,6 +722,11 @@ def main():
                 is_eval=True,
                 episodes=config.get('eval_episode_num', 10),
             )
+            # 生成 eval_openl 视频
+            if config.get('video_pred_log', False):
+                eval_dataset = make_dataset(eval_eps, config)
+                video_pred = agent._wm.video_pred(next(eval_dataset))
+                logger.video("eval_openl", to_np(video_pred))
 
         # Training
         print(f"Training... (step {agent._step})")
