@@ -13,10 +13,19 @@ from mani_skill.envs.tasks.tabletop.pick_cube import PickCubeEnv
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs.pose import Pose
+from mani_skill.sensors.camera import CameraConfig
 
+@register_env("PickCubeCam-V1", override=True)
+class PickCubeCamEnv(PickCubeEnv):
+    """PickCube with hand camera using PandaWristCam agent."""
+
+    SUPPORTED_ROBOTS = ["panda_wristcam"]
+
+    def __init__(self, *args, robot_uids="panda_wristcam", **kwargs):
+        super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
 @register_env("PickCubeSpurious-v1", max_episode_steps=50)
-class PickCubeSpuriousEnv(PickCubeEnv):
+class PickCubeSpuriousEnv(PickCubeCamEnv):
     """
     PickCube with a spurious yellow ball distractor.
 
@@ -27,7 +36,7 @@ class PickCubeSpuriousEnv(PickCubeEnv):
     """
 
     # Spurious ball settings
-    spurious_ball_radius = 0.015  # 1.5cm radius
+    spurious_ball_radius = 0.025  # 1.5cm radius
 
     def __init__(self, *args, spurious_offset=0.01, **kwargs):
         """
@@ -135,26 +144,92 @@ class PickCubeSpuriousStaticEnv(PickCubeEnv):
 # ============================================================================
 if __name__ == "__main__":
     import gymnasium as gym
+    import matplotlib.pyplot as plt
 
-    # 测试环境
-    for env_name in ["PickCubeSpurious-v1", "PickCubeSpuriousRandom-v1", "PickCubeSpuriousStatic-v1"]:
-        print(f"\nTesting {env_name}...")
-        env = gym.make(
-            env_name,
-            num_envs=1,
-            obs_mode="rgb+state",
-            render_mode="human",
-        )
-        obs, info = env.reset()
-        print(f"  Observation keys: {obs.keys()}")
-        print(f"  Action space: {env.action_space}")
+    def print_obs_structure(obs, prefix=""):
+        """递归打印 obs 的结构"""
+        if isinstance(obs, dict):
+            for key, value in obs.items():
+                print_obs_structure(value, prefix=f"{prefix}{key}.")
+        elif isinstance(obs, torch.Tensor):
+            print(f"  {prefix[:-1]}: Tensor shape={tuple(obs.shape)}, dtype={obs.dtype}")
+        elif isinstance(obs, np.ndarray):
+            print(f"  {prefix[:-1]}: ndarray shape={obs.shape}, dtype={obs.dtype}")
+        else:
+            print(f"  {prefix[:-1]}: {type(obs).__name__}")
 
-        for step in range(30):
+    def visualize_obs_images(obs, fig, axes):
+        """实时更新 obs 中的图像"""
+        images = []
+        titles = []
+
+        # 提取 sensor_data 中的图像
+        if 'sensor_data' in obs:
+            for cam_name, cam_data in obs['sensor_data'].items():
+                if isinstance(cam_data, dict):
+                    if 'rgb' in cam_data:
+                        img = cam_data['rgb'][0]
+                        if isinstance(img, torch.Tensor):
+                            img = img.cpu().numpy()
+                        images.append(img)
+                        titles.append(cam_name)
+
+        if not images:
+            return
+
+        for i, (img, title) in enumerate(zip(images, titles)):
+            axes[i].clear()
+            axes[i].imshow(img.astype(np.uint8) if img.max() > 1 else img)
+            axes[i].set_title(title)
+            axes[i].axis('off')
+
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+
+    # 测试环境 - 实时显示
+    env_name = "PickCubeSpurious"
+    print(f"\n{'='*60}")
+    print(f"Testing {env_name} with live visualization...")
+    print('='*60)
+
+    env = gym.make(
+        env_name,
+        num_envs=1,
+        obs_mode="rgb+state",
+        render_mode="rgb_array",
+    )
+    obs, info = env.reset()
+
+    # 设置实时显示
+    plt.ion()
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    fig.suptitle("Live Camera Views (Press Ctrl+C to stop)")
+
+    print("\nRunning environment with random actions...")
+    print("Close the window or press Ctrl+C to stop.\n")
+
+    try:
+        step = 0
+        while True:
             action = env.action_space.sample()
-            obs, reward, terminated, truncated, info = env.step(action)
-            env.render()
-            if terminated or truncated:
-                obs, info = env.reset()
+            obs, reward, done, truncated, info = env.step(action)
 
+            visualize_obs_images(obs, fig, axes)
+            plt.pause(0.05)
+
+            step += 1
+            if step % 50 == 0:
+                print(f"Step {step}, reward: {reward.item():.3f}")
+
+            if done or truncated:
+                print(f"Episode ended at step {step}. Resetting...")
+                obs, info = env.reset()
+                step = 0
+
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    finally:
+        plt.ioff()
+        plt.close()
         env.close()
-        print(f"  {env_name} OK!")
+        print(f"\n{env_name} done!")
