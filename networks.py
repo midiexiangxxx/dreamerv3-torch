@@ -193,6 +193,10 @@ class RSSM(nn.Module):
                 )
 
         prior = self.img_step(prev_state, prev_action)
+        """
+        h_t = prior["deter"]
+        posterior = self._obs_stat_layer(self._obs_out_layers(torch.cat([h_t, embed], -1)))
+        """
         x = torch.cat([prior["deter"], embed], -1)
         # (batch_size, prior_deter + embed) -> (batch_size, hidden)
         x = self._obs_out_layers(x)
