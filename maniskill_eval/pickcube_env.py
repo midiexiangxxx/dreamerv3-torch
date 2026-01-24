@@ -187,9 +187,11 @@ if __name__ == "__main__":
         fig.canvas.flush_events()
 
     # 测试环境 - 实时显示
-    env_name = "PickCubeSpurious"
+    env_name = "PickCubeSpurious-v1"
+    img_size = 96  # 图像大小
     print(f"\n{'='*60}")
     print(f"Testing {env_name} with live visualization...")
+    print(f"Image size: {img_size}x{img_size}")
     print('='*60)
 
     env = gym.make(
@@ -197,9 +199,11 @@ if __name__ == "__main__":
         num_envs=1,
         obs_mode="rgb+state",
         render_mode="rgb_array",
+        sensor_configs=dict(width=img_size, height=img_size),  # 设置图像大小
     )
     obs, info = env.reset()
-
+    print_obs_structure(obs)
+    
     # 设置实时显示
     plt.ion()
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
