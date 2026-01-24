@@ -1,5 +1,5 @@
 defaults:
-
+  vector_env: True
   logdir: null
   traindir: null
   evaldir: null
