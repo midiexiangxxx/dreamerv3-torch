@@ -136,3 +136,7 @@ dmypy.json
 
 # VScode
 .vscode/*
+
+comparison.npz
+comparison.png
+*.mp4
