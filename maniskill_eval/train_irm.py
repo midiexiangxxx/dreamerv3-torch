@@ -186,6 +186,8 @@ class WorldModelIRM(WorldModel):
 
             # Step 4: 总 loss
             mean_loss = sum(domain_losses_raw.values()) / len(domain_losses_raw)
+            if irm_penalty.dim() > 0:
+                irm_penalty = irm_penalty.squeeze()
             total_loss = mean_loss + irm_weight * irm_penalty
 
             # Step 5: 优化
@@ -240,7 +242,9 @@ class DreamerIRM(nn.Module):
         self._logger = logger
         self._datasets_by_domain = datasets_by_domain
         self._should_pretrain = tools.Once()
-        self._should_train = tools.Every(config.train_every)
+        batch_steps = config.batch_size * config.batch_length
+        print(f'should_train every {batch_steps / config.train_ratio} steps')
+        self._should_train = tools.Every(batch_steps / config.train_ratio)
         self._should_log = tools.Every(config.log_every)
         self._step = logger.step
 
@@ -272,8 +276,16 @@ class DreamerIRM(nn.Module):
         """
         self._step = self._logger.step
 
-        if self._should_train(self._step):
-            self._train_irm()
+        # 增加调用计数
+        if not hasattr(self, '_call_count'):
+            self._call_count = 0
+        self._call_count += 1
+
+        if training:
+            train_steps = self._should_train(self._step)
+            if train_steps > 0:
+                for _ in range(train_steps):
+                    self._train_irm()
 
         policy_output, state = self._policy(obs, done, state, training)
 
@@ -287,49 +299,50 @@ class DreamerIRM(nn.Module):
         """
         Policy network forward pass
         """
-        if state is None:
-            batch_size = len(done)
-            latent = self._wm.dynamics.initial(batch_size)
-            action = torch.zeros((batch_size, self._num_act), device=self._config.device)
-        else:
-            latent, action = state
+        with torch.no_grad():
+            if state is None:
+                batch_size = len(done)
+                latent = self._wm.dynamics.initial(batch_size)
+                action = torch.zeros((batch_size, self._num_act), device=self._config.device)
+            else:
+                latent, action = state
 
-        # Preprocess observation
-        obs = {
-            k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
-            for k, v in obs.items()
-        }
-        if 'image' in obs:
-            obs['image'] = obs['image'] / 255.0
+            # Preprocess observation
+            obs = {
+                k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
+                for k, v in obs.items()
+            }
+            if 'image' in obs:
+                obs['image'] = obs['image'] / 255.0
 
-        # Encode
-        embed = self._wm.encoder(obs)
+            # Encode
+            embed = self._wm.encoder(obs)
 
-        # Reset latent for done episodes
-        done_tensor = torch.tensor(done, device=self._config.device, dtype=torch.bool)
-        is_first = torch.zeros_like(done_tensor)
+            # Reset latent for done episodes
+            done_tensor = torch.tensor(done, device=self._config.device, dtype=torch.bool)
+            is_first = torch.zeros_like(done_tensor)
 
-        # Update latent
-        latent, _ = self._wm.dynamics.obs_step(
-            latent, action, embed, obs.get('is_first', is_first)
-        )
+            # Update latent
+            latent, _ = self._wm.dynamics.obs_step(
+                latent, action, embed, obs.get('is_first', is_first)
+            )
 
-        # Get action from actor
-        feat = self._wm.dynamics.get_feat(latent)
-        actor = self._task_behavior.actor(feat)
+            # Get action from actor
+            feat = self._wm.dynamics.get_feat(latent)
+            actor = self._task_behavior.actor(feat)
 
-        if training:
-            action = actor.sample()
-        else:
-            action = actor.mode()
+            if training:
+                action = actor.sample()
+            else:
+                action = actor.mode()
 
-        # Clamp action
-        if not self._is_discrete:
-            action = action.clamp(-1, 1)
+            # Clamp action
+            if not self._is_discrete:
+                action = action.clamp(-1, 1)
 
-        state = (latent, action)
+            state = (latent, action)
 
-        return {'action': action.detach().cpu().numpy()}, state
+        return {'action': action.cpu().numpy()}, state
 
     def _train_irm(self):
         """
@@ -353,11 +366,13 @@ class DreamerIRM(nn.Module):
         _, _, _, _, behavior_metrics = self._task_behavior._train(post, reward_fn)
 
         # Log metrics
-        if self._should_log(self._step):
+        should_log = self._should_log(self._step)
+        if should_log:
             for key, value in wm_metrics.items():
                 self._logger.scalar(f"wm/{key}", value)
             for key, value in behavior_metrics.items():
                 self._logger.scalar(f"behavior/{key}", value)
+            self._logger.write(fps=True)
 
 
 # ============================================================================
@@ -414,8 +429,8 @@ class MultiDomainEnvManager:
             yellow_ball_prob=cfg["yellow_ball_prob"],
         )
 
-        if cfg.get("device"):
-            env_kwargs["device"] = cfg["device"]
+        # 注意: ManiSkill 的 GPU 选择通常通过 CUDA_VISIBLE_DEVICES 环境变量控制
+        # 如果需要在不同 GPU 上运行不同环境，需要在进程级别设置
 
         env = gym.make("PickCubeSpuriousProb-v1", **env_kwargs)
         return ManiSkillVecEnvWrapper(env, img_size=img_size, model_device=self.model_device)
@@ -876,8 +891,7 @@ def main():
     # Eval env
     print("Creating eval environment...")
     import mani_skill.envs
-    eval_env_raw = gym.make(
-        "PickCubeSpuriousProb-v1",
+    eval_env_kwargs = dict(
         num_envs=4,
         obs_mode="rgb+state",
         control_mode="pd_ee_delta_pose",
@@ -886,8 +900,9 @@ def main():
         sim_backend="physx_cuda",
         shader_dir=args.shader,
         yellow_ball_prob=args.eval_prob,
-        device=args.eval_device,
     )
+
+    eval_env_raw = gym.make("PickCubeSpuriousProb-v1", **eval_env_kwargs)
     eval_env = ManiSkillVecEnvWrapper(eval_env_raw, img_size=args.img_size, model_device=args.model_device)
     eval_eps = {}
 
