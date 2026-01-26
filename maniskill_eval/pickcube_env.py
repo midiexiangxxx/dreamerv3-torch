@@ -100,6 +100,70 @@ class PickCubeSpuriousRandomEnv(PickCubeSpuriousEnv):
             self.spurious_ball.set_pose(Pose.create_from_pq(ball_xyz))
 
 
+@register_env("PickCubeSpuriousProb-v1", max_episode_steps=50)
+class PickCubeSpuriousProbEnv(PickCubeCamEnv):
+    """
+    PickCube with a spurious yellow ball that appears with configurable probability.
+
+    For IRM experiments:
+    - Domain 1 (train): yellow_ball_prob=0.9 (90% yellow ball appears)
+    - Domain 2 (train): yellow_ball_prob=0.8 (80% yellow ball appears)
+    - Domain 3 (eval):  yellow_ball_prob=0.1 (10% yellow ball appears)
+
+    The spurious correlation is: yellow ball presence correlates with task,
+    but the causal feature is the red cube position.
+    """
+
+    spurious_ball_radius = 0.025
+
+    def __init__(self, *args, yellow_ball_prob=0.9, spurious_offset=0.01, **kwargs):
+        """
+        Args:
+            yellow_ball_prob: Probability of yellow ball appearing (0.0 to 1.0)
+            spurious_offset: Distance of yellow ball from red cube
+        """
+        self.yellow_ball_prob = yellow_ball_prob
+        self.spurious_offset = spurious_offset
+        super().__init__(*args, **kwargs)
+
+    def _load_scene(self, options: dict):
+        super()._load_scene(options)
+
+        # 添加黄色干扰球
+        self.spurious_ball = actors.build_sphere(
+            self.scene,
+            radius=self.spurious_ball_radius,
+            color=[1, 1, 0, 1],  # 黄色
+            name="spurious_ball",
+            body_type="dynamic",
+            add_collision=True,
+            initial_pose=sapien.Pose(p=[0, 0, self.spurious_ball_radius]),
+        )
+
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        super()._initialize_episode(env_idx, options)
+
+        b = len(env_idx) if env_idx.ndim > 0 else self.num_envs
+        cube_pos = self.cube.pose.p  # (b, 3)
+
+        with torch.device(self.device):
+            # 随机决定每个环境是否显示黄球
+            show_ball = torch.rand(b, device=self.device) < self.yellow_ball_prob
+
+            ball_xyz = cube_pos.clone()
+            # 黄球在红色方块右侧
+            ball_xyz[:, 1] += self.spurious_offset + self.cube_half_size + self.spurious_ball_radius
+
+            # 不显示的球移到桌子下面（不可见）
+            ball_xyz[:, 2] = torch.where(
+                show_ball,
+                torch.full((b,), self.spurious_ball_radius, device=self.device),
+                torch.full((b,), -1.0, device=self.device)  # 移到桌下
+            )
+
+            self.spurious_ball.set_pose(Pose.create_from_pq(ball_xyz))
+
+
 @register_env("PickCubeSpuriousStatic-v1", max_episode_steps=50)
 class PickCubeSpuriousStaticEnv(PickCubeEnv):
     """
