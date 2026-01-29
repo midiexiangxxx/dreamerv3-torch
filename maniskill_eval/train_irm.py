@@ -85,8 +85,11 @@ class WorldModelIRM(WorldModel):
         计算单个 domain 的 loss (用于 IRM)
 
         Returns:
-            loss: scalar tensor (mean over batch)
-            metrics: dict of metrics
+            total_loss: scalar tensor (mean over batch) - 总 loss (不含 reward)
+            reward_loss: scalar tensor (mean over batch) - reward 预测 loss (用于 IRM penalty)
+            losses_dict: dict of raw losses
+            kl_value: KL divergence value
+            extra_metrics: dict of additional metrics (dyn_loss, rep_loss, prior_ent, post_ent)
         """
         data = self.preprocess(data)
 
@@ -121,14 +124,32 @@ class WorldModelIRM(WorldModel):
                 loss = -pred.log_prob(data[name])
                 losses[name] = loss
 
-            # Scale losses
-            scaled = {
+            # Separate reward loss for IRM penalty
+            reward_loss = losses["reward"] * self._scales.get("reward", 1.0)
+            reward_loss_mean = reward_loss.mean()
+
+            # Scale non-reward losses
+            non_reward_scaled = {
                 key: value * self._scales.get(key, 1.0)
                 for key, value in losses.items()
+                if key != "reward"
             }
-            domain_loss = sum(scaled.values()) + kl_loss
+            # Total loss without reward (for ERM part)
+            non_reward_loss = sum(non_reward_scaled.values()) + kl_loss
 
-        return domain_loss.mean(), losses, kl_value
+            # Extra metrics for detailed logging
+            extra_metrics = {
+                "dyn_loss": to_np(dyn_loss),
+                "rep_loss": to_np(rep_loss),
+                "kl": to_np(torch.mean(kl_value)),
+                "kl_free": kl_free,
+                "dyn_scale": dyn_scale,
+                "rep_scale": rep_scale,
+                "prior_ent": to_np(torch.mean(self.dynamics.get_dist(prior).entropy())),
+                "post_ent": to_np(torch.mean(self.dynamics.get_dist(post).entropy())),
+            }
+
+        return non_reward_loss.mean(), reward_loss_mean, losses, kl_value, extra_metrics
 
     def _train_irm(self, data_by_domain: Dict[int, dict], current_step: int):
         """
@@ -146,36 +167,45 @@ class WorldModelIRM(WorldModel):
         metrics = {}
 
         with tools.RequiresGrad(self):
-            domain_losses = {}
-            domain_losses_raw = {}  # 不乘 scale 的版本
+            domain_non_reward_losses = {}  # Loss without reward (ERM part)
+            domain_reward_losses = {}  # Reward loss only
+            domain_reward_losses_scaled = {}  # Reward loss * irm_scale (for IRM penalty)
+            all_extra_metrics = {}
 
             # Step 1: 计算每个 domain 的 loss
             for domain_id, data in data_by_domain.items():
-                loss, losses_dict, kl_value = self._compute_domain_loss(data)
-                domain_losses_raw[domain_id] = loss
+                non_reward_loss, reward_loss, losses_dict, kl_value, extra_metrics = self._compute_domain_loss(data)
+
+                domain_non_reward_losses[domain_id] = non_reward_loss
+                domain_reward_losses[domain_id] = reward_loss
                 # 乘以 irm_scale (用于计算 IRM penalty 的梯度)
-                domain_losses[domain_id] = loss * self.irm_scale
+                domain_reward_losses_scaled[domain_id] = reward_loss * self.irm_scale
 
                 # 记录每个 domain 的 metrics
                 for name, l in losses_dict.items():
                     metrics[f"domain{domain_id}_{name}_loss"] = to_np(l.mean())
-                metrics[f"domain{domain_id}_total_loss"] = loss.item()
+                metrics[f"domain{domain_id}_non_reward_loss"] = non_reward_loss.item()
+                metrics[f"domain{domain_id}_reward_loss"] = reward_loss.item()
 
-            # Step 2: 计算 IRM penalty
-            # IRMv1: penalty = Σ_e ||∇_w (w · L_e)||² where w=1 (i.e., irm_scale=1)
+                # Store extra metrics from first domain only (they should be similar)
+                if domain_id == list(data_by_domain.keys())[0]:
+                    all_extra_metrics = extra_metrics
+
+            # Step 2: 计算 IRM penalty (只对 reward loss)
+            # IRMv1: penalty = Σ_e ||∇_w (w · L_reward_e)||² where w=1 (i.e., irm_scale=1)
             irm_penalty = torch.tensor(0.0, device=self._config.device)
 
-            for domain_id, scaled_loss in domain_losses.items():
-                # 计算 loss 对 irm_scale 的梯度
+            for domain_id, scaled_reward_loss in domain_reward_losses_scaled.items():
+                # 计算 reward loss 对 irm_scale 的梯度
                 grad = torch.autograd.grad(
-                    scaled_loss,
+                    scaled_reward_loss,
                     self.irm_scale,
                     create_graph=True,
                     retain_graph=True
                 )[0]
                 irm_penalty = irm_penalty + grad.pow(2)
 
-            irm_penalty = irm_penalty / len(domain_losses)
+            irm_penalty = irm_penalty / len(domain_reward_losses_scaled)
 
             # Step 3: Anneal IRM weight
             # 前期主要靠 ERM，后期加入 IRM
@@ -185,10 +215,15 @@ class WorldModelIRM(WorldModel):
                 irm_weight = self.irm_lambda
 
             # Step 4: 总 loss
-            mean_loss = sum(domain_losses_raw.values()) / len(domain_losses_raw)
+            # Total = mean(non_reward_losses) + mean(reward_losses) + irm_weight * irm_penalty
+            mean_non_reward_loss = sum(domain_non_reward_losses.values()) / len(domain_non_reward_losses)
+            mean_reward_loss = sum(domain_reward_losses.values()) / len(domain_reward_losses)
+
             if irm_penalty.dim() > 0:
                 irm_penalty = irm_penalty.squeeze()
-            total_loss = mean_loss + irm_weight * irm_penalty
+
+            # IRM penalty 只加到 reward loss 上
+            total_loss = mean_non_reward_loss + mean_reward_loss + irm_weight * irm_penalty
 
             # Step 5: 优化
             opt_metrics = self._model_opt(total_loss, self.parameters())
@@ -197,8 +232,12 @@ class WorldModelIRM(WorldModel):
         # 记录 IRM metrics
         metrics["irm_penalty"] = irm_penalty.item()
         metrics["irm_weight"] = irm_weight
-        metrics["mean_domain_loss"] = mean_loss.item()
+        metrics["mean_non_reward_loss"] = mean_non_reward_loss.item()
+        metrics["mean_reward_loss"] = mean_reward_loss.item()
         metrics["total_loss"] = total_loss.item()
+
+        # 记录详细的 world model metrics
+        metrics.update(all_extra_metrics)
 
         # 为 behavior 训练返回最后一个 domain 的 posterior
         # (或者可以合并所有 domain 的数据)
@@ -372,6 +411,15 @@ class DreamerIRM(nn.Module):
                 self._logger.scalar(f"wm/{key}", value)
             for key, value in behavior_metrics.items():
                 self._logger.scalar(f"behavior/{key}", value)
+
+            # Log video prediction (open-loop imagination)
+            if self._config.get('video_pred_log', False):
+                # Use the last domain's data for video prediction
+                last_domain_id = list(self._datasets_by_domain.keys())[-1]
+                video_data = next(self._datasets_by_domain[last_domain_id])
+                video_pred = self._wm.video_pred(video_data)
+                self._logger.video("eval_openl", to_np(video_pred))
+
             self._logger.write(fps=True)
 
 
@@ -795,6 +843,7 @@ def main():
         'eval_every': 10000,
         'eval_episode_num': 10,
         'log_every': 1000,
+        'video_pred_log': True,  # Enable video prediction logging
         'encoder': {
             'mlp_keys': 'vector',
             'cnn_keys': 'image',
