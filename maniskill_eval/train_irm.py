@@ -139,8 +139,8 @@ class WorldModelIRM(WorldModel):
 
             # Extra metrics for detailed logging
             extra_metrics = {
-                "dyn_loss": to_np(dyn_loss),
-                "rep_loss": to_np(rep_loss),
+                "dyn_loss": to_np(torch.mean(dyn_loss)),
+                "rep_loss": to_np(torch.mean(rep_loss)),
                 "kl": to_np(torch.mean(kl_value)),
                 "kl_free": kl_free,
                 "dyn_scale": dyn_scale,
