@@ -897,21 +897,6 @@ def main():
     with open(logdir / 'config.yaml', 'w') as f:
         yaml_saver.dump(config, f)
 
-    # Wandb
-    use_wandb = args.wandb and WANDB_AVAILABLE
-    if use_wandb:
-        wandb.init(
-            project=args.wandb_project,
-            name=f"irm_d1={args.domain1_prob}_d2={args.domain2_prob}_eval={args.eval_prob}",
-            config=config,
-            dir=str(logdir),
-        )
-
-    # Logger
-    base_logger = tools.Logger(logdir, 0)
-    logger = WandbLogger(base_logger, use_wandb=use_wandb)
-    timer = PerfTimer(enabled=args.profile)
-
     # ========== 创建环境 ==========
     domain_configs = [
         {
@@ -937,6 +922,26 @@ def main():
     )
     env_manager.set_traindirs(logdir)
 
+    # Wandb
+    use_wandb = args.wandb and WANDB_AVAILABLE
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=f"irm_d1={args.domain1_prob}_d2={args.domain2_prob}_eval={args.eval_prob}",
+            config=config,
+            dir=str(logdir),
+            resume="allow",
+        )
+
+    # Logger
+    base_step = sum(
+        count_steps(env_manager.traindirs[domain_id])
+        for domain_id in env_manager.envs.keys()
+    )
+    base_logger = tools.Logger(logdir, base_step)
+    logger = WandbLogger(base_logger, use_wandb=use_wandb)
+    timer = PerfTimer(enabled=args.profile)
+
     # Eval env
     print("Creating eval environment...")
     import mani_skill.envs
@@ -958,7 +963,6 @@ def main():
     config['num_actions'] = env_manager.get_act_space().shape[0]
 
     # ========== Prefill ==========
-    print(f"Prefill dataset ({config['prefill']} steps per domain)...")
     async_writers = {
         domain_id: AsyncEpisodeWriter(max_queue_size=100)
         for domain_id in env_manager.envs.keys()
@@ -977,12 +981,16 @@ def main():
         actions = random_actor.sample((batch_size,))
         return {"action": actions}, None
 
-    # Prefill each domain
+    # Prefill each domain (only if needed)
     for domain_id, env in env_manager.envs.items():
-        print(f"  Prefilling domain {domain_id}...")
-        cache = env_manager.replay_buffers[domain_id]
         directory = env_manager.traindirs[domain_id]
+        cache = env_manager.replay_buffers[domain_id]
+        prefill_steps = max(0, config['prefill'] - count_steps(directory))
+        if prefill_steps <= 0:
+            print(f"  Prefill skipped for domain {domain_id} (enough data on disk)")
+            continue
 
+        print(f"  Prefilling domain {domain_id} ({prefill_steps} steps)...")
         _simulate_single_domain(
             agent=random_agent,
             env=env,
@@ -990,7 +998,7 @@ def main():
             directory=directory,
             logger=logger,
             domain_id=domain_id,
-            steps=config['prefill'],
+            steps=prefill_steps,
             async_writer=async_writers[domain_id],
         )
         print(f"    Domain {domain_id}: {len(cache)} episodes")
@@ -1020,6 +1028,18 @@ def main():
         datasets_by_domain,
     ).to(config['device'])
     agent.requires_grad_(requires_grad=False)
+
+    # Load checkpoint
+    ckpt_path = logdir / "latest.pt"
+    if ckpt_path.exists():
+        checkpoint = torch.load(ckpt_path, map_location=config['device'])
+        agent.load_state_dict(checkpoint["agent_state_dict"])
+        tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
+        agent._should_pretrain._once = False
+        if "step" in checkpoint:
+            agent._step = checkpoint["step"]
+            logger.step = checkpoint["step"]
+        print(f"Loaded checkpoint: {ckpt_path}")
 
     # ========== 主训练循环 ==========
     print("Starting training...")
