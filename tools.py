@@ -7,6 +7,7 @@ import pathlib
 import re
 import time
 import random
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -18,6 +19,207 @@ from torch.utils.tensorboard import SummaryWriter
 
 
 to_np = lambda x: x.detach().cpu().numpy()
+
+
+# ============================================================================
+# Performance Profiler
+# ============================================================================
+
+class Profiler:
+    """
+    Performance profiler for tracking time spent in different operations.
+
+    Usage:
+        profiler = Profiler()
+
+        with profiler.timer("train"):
+            # training code
+            pass
+
+        with profiler.timer("rollout"):
+            # rollout code
+            pass
+
+        # Print summary
+        profiler.summary()
+    """
+
+    def __init__(self, use_cuda_events=True, enabled=True):
+        """
+        Args:
+            use_cuda_events: Use CUDA events for GPU timing (more accurate)
+            enabled: Whether profiling is enabled
+        """
+        self._enabled = enabled
+        self._use_cuda = use_cuda_events and torch.cuda.is_available()
+        self._timings = collections.defaultdict(list)
+        self._counts = collections.defaultdict(int)
+        self._active_timers = {}
+        self._start_time = time.time()
+
+    @contextmanager
+    def timer(self, name):
+        """Context manager for timing a code block."""
+        if not self._enabled:
+            yield
+            return
+
+        if self._use_cuda:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            try:
+                yield
+            finally:
+                end_event.record()
+                torch.cuda.synchronize()
+                elapsed = start_event.elapsed_time(end_event) / 1000.0  # Convert to seconds
+                self._timings[name].append(elapsed)
+                self._counts[name] += 1
+        else:
+            start = time.perf_counter()
+            try:
+                yield
+            finally:
+                elapsed = time.perf_counter() - start
+                self._timings[name].append(elapsed)
+                self._counts[name] += 1
+
+    def start(self, name):
+        """Start a named timer (for non-context-manager usage)."""
+        if not self._enabled:
+            return
+        if self._use_cuda:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            self._active_timers[name] = ('cuda', event)
+        else:
+            self._active_timers[name] = ('cpu', time.perf_counter())
+
+    def stop(self, name):
+        """Stop a named timer and record the elapsed time."""
+        if not self._enabled or name not in self._active_timers:
+            return
+
+        timer_type, start_data = self._active_timers.pop(name)
+        if timer_type == 'cuda':
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            torch.cuda.synchronize()
+            elapsed = start_data.elapsed_time(end_event) / 1000.0
+        else:
+            elapsed = time.perf_counter() - start_data
+
+        self._timings[name].append(elapsed)
+        self._counts[name] += 1
+
+    def get_stats(self, name):
+        """Get statistics for a specific timer."""
+        if name not in self._timings or not self._timings[name]:
+            return None
+
+        times = np.array(self._timings[name])
+        return {
+            'count': self._counts[name],
+            'total': float(np.sum(times)),
+            'mean': float(np.mean(times)),
+            'std': float(np.std(times)),
+            'min': float(np.min(times)),
+            'max': float(np.max(times)),
+            'median': float(np.median(times)),
+        }
+
+    def get_all_stats(self):
+        """Get statistics for all timers."""
+        return {name: self.get_stats(name) for name in self._timings}
+
+    def summary(self, top_n=None, sort_by='total'):
+        """
+        Print a summary of all timings.
+
+        Args:
+            top_n: Only show top N entries (None for all)
+            sort_by: Sort by 'total', 'mean', 'count', etc.
+        """
+        if not self._timings:
+            print("No profiling data collected.")
+            return
+
+        total_wall_time = time.time() - self._start_time
+        stats = self.get_all_stats()
+
+        # Sort by specified key
+        sorted_stats = sorted(stats.items(), key=lambda x: x[1][sort_by], reverse=True)
+        if top_n:
+            sorted_stats = sorted_stats[:top_n]
+
+        print("\n" + "=" * 80)
+        print("PROFILER SUMMARY")
+        print("=" * 80)
+        print(f"Total wall time: {total_wall_time:.2f}s\n")
+
+        # Header
+        header = f"{'Operation':<25} {'Count':>8} {'Total(s)':>10} {'Mean(ms)':>10} {'Std(ms)':>10} {'%Time':>8}"
+        print(header)
+        print("-" * 80)
+
+        total_profiled = sum(s['total'] for s in stats.values())
+
+        for name, s in sorted_stats:
+            pct = (s['total'] / total_wall_time) * 100 if total_wall_time > 0 else 0
+            print(f"{name:<25} {s['count']:>8} {s['total']:>10.3f} {s['mean']*1000:>10.2f} {s['std']*1000:>10.2f} {pct:>7.1f}%")
+
+        print("-" * 80)
+        print(f"{'Profiled total':<25} {'':<8} {total_profiled:>10.3f} {'':<10} {'':<10} {(total_profiled/total_wall_time)*100:>7.1f}%")
+        print(f"{'Unaccounted':<25} {'':<8} {total_wall_time - total_profiled:>10.3f} {'':<10} {'':<10} {((total_wall_time - total_profiled)/total_wall_time)*100:>7.1f}%")
+        print("=" * 80 + "\n")
+
+    def log_to_logger(self, logger, prefix="profiler/"):
+        """Log profiling stats to a Logger instance."""
+        for name, s in self.get_all_stats().items():
+            if s is not None:
+                logger.scalar(f"{prefix}{name}_total", s['total'])
+                logger.scalar(f"{prefix}{name}_mean_ms", s['mean'] * 1000)
+
+    def reset(self):
+        """Reset all timing data."""
+        self._timings.clear()
+        self._counts.clear()
+        self._active_timers.clear()
+        self._start_time = time.time()
+
+    def reset_timer(self, name):
+        """Reset a specific timer."""
+        if name in self._timings:
+            del self._timings[name]
+        if name in self._counts:
+            del self._counts[name]
+
+
+# Global profiler instance
+_global_profiler = None
+
+
+def get_profiler():
+    """Get or create the global profiler instance."""
+    global _global_profiler
+    if _global_profiler is None:
+        _global_profiler = Profiler(enabled=False)  # Disabled by default
+    return _global_profiler
+
+
+def enable_profiler(use_cuda_events=True):
+    """Enable the global profiler."""
+    global _global_profiler
+    _global_profiler = Profiler(use_cuda_events=use_cuda_events, enabled=True)
+    return _global_profiler
+
+
+def disable_profiler():
+    """Disable the global profiler."""
+    global _global_profiler
+    if _global_profiler:
+        _global_profiler._enabled = False
 
 
 def symlog(x):
@@ -137,6 +339,7 @@ def simulate(
     episodes=0,
     state=None,
 ):
+    profiler = get_profiler()
     # initialize or unpack simulation state
     if state is None:
         step, episode = 0, 0
@@ -151,8 +354,9 @@ def simulate(
         # reset envs if necessary
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
-            results = [envs[i].reset() for i in indices]
-            results = [r() for r in results]
+            with profiler.timer("env_reset"):
+                results = [envs[i].reset() for i in indices]
+                results = [r() for r in results]
             for index, result in zip(indices, results):
                 t = result.copy()
                 t = {k: convert(v) for k, v in t.items()}
@@ -175,8 +379,9 @@ def simulate(
             action = np.array(action)
         assert len(action) == len(envs)
         # step envs
-        results = [e.step(a) for e, a in zip(envs, action)]
-        results = [r() for r in results]
+        with profiler.timer("env_step"):
+            results = [e.step(a) for e, a in zip(envs, action)]
+            results = [r() for r in results]
         obs, reward, done = zip(*[p[:3] for p in results])
         obs = list(obs)
         reward = list(reward)
@@ -202,7 +407,8 @@ def simulate(
             indices = [index for index, d in enumerate(done) if d]
             # logging for done episode
             for i in indices:
-                save_episodes(directory, {envs[i].id: cache[envs[i].id]})
+                with profiler.timer("io_save_episode"):
+                    save_episodes(directory, {envs[i].id: cache[envs[i].id]})
                 length = len(cache[envs[i].id]["reward"]) - 1
                 score = float(np.array(cache[envs[i].id]["reward"]).sum())
                 video = cache[envs[i].id]["image"]
@@ -362,15 +568,17 @@ def sample_episodes(episodes, length, seed=0):
 
 
 def load_episodes(directory, limit=None, reverse=True):
+    profiler = get_profiler()
     directory = pathlib.Path(directory).expanduser()
     episodes = collections.OrderedDict()
     total = 0
     if reverse:
         for filename in reversed(sorted(directory.glob("*.npz"))):
             try:
-                with filename.open("rb") as f:
-                    episode = np.load(f)
-                    episode = {k: episode[k] for k in episode.keys()}
+                with profiler.timer("io_load_episode"):
+                    with filename.open("rb") as f:
+                        episode = np.load(f)
+                        episode = {k: episode[k] for k in episode.keys()}
             except Exception as e:
                 print(f"Could not load episode: {e}")
                 continue
@@ -382,9 +590,10 @@ def load_episodes(directory, limit=None, reverse=True):
     else:
         for filename in sorted(directory.glob("*.npz")):
             try:
-                with filename.open("rb") as f:
-                    episode = np.load(f)
-                    episode = {k: episode[k] for k in episode.keys()}
+                with profiler.timer("io_load_episode"):
+                    with filename.open("rb") as f:
+                        episode = np.load(f)
+                        episode = {k: episode[k] for k in episode.keys()}
             except Exception as e:
                 print(f"Could not load episode: {e}")
                 continue
@@ -998,3 +1207,39 @@ def recursively_load_optim_state_dict(obj, optimizers_state_dicts):
         for key in keys:
             obj_now = getattr(obj_now, key)
         obj_now.load_state_dict(state_dict)
+
+
+# ============================================================================
+# Optimized Replay Buffer Integration
+# ============================================================================
+
+def create_replay_buffer(directory, config):
+    """
+    Create optimized ReplayBuffer from config.
+
+    Usage:
+        buffer = create_replay_buffer(config.traindir, config)
+        buffer.load_from_directory(limit=config.dataset_size)
+        train_eps = buffer.as_dict()  # Compatible with existing code
+        train_dataset = buffer.get_dataset()  # Prefetch-enabled iterator
+    """
+    from replay_buffer import ReplayBuffer
+    return ReplayBuffer(
+        directory=directory,
+        max_steps=getattr(config, 'dataset_size', None),
+        batch_size=getattr(config, 'batch_size', 16),
+        batch_length=getattr(config, 'batch_length', 64),
+        prefetch_batches=4,
+        seed=getattr(config, 'seed', 0),
+    )
+
+
+def erase_over_episodes_optimized(buffer, dataset_size):
+    """
+    Optimized version - buffer handles FIFO eviction automatically.
+
+    This function exists for compatibility; the ReplayBuffer handles
+    eviction internally with O(1) complexity.
+    """
+    # Buffer already manages this internally
+    return buffer.total_steps

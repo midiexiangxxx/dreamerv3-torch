@@ -3,6 +3,8 @@ import functools
 import os
 import pathlib
 import sys
+import signal
+from contextlib import nullcontext
 
 os.environ["MUJOCO_GL"] = "osmesa"
 
@@ -112,6 +114,7 @@ class Dreamer(nn.Module):
         )[config.expl_behavior]().to(self._config.device)
 
     def __call__(self, obs, reset, state=None, training=True):
+        profiler = tools.get_profiler()
         step = self._step
         if training:
             steps = (
@@ -120,7 +123,10 @@ class Dreamer(nn.Module):
                 else self._should_train(step)
             )
             for _ in range(steps):
-                self._train(next(self._dataset))
+                with profiler.timer("sample_batch"):
+                    data = next(self._dataset)
+                with profiler.timer("train_step"):
+                    self._train(data)
                 self._update_count += 1
                 self._metrics["update_count"] = self._update_count
             if self._should_log(step):
@@ -132,7 +138,8 @@ class Dreamer(nn.Module):
                     self._logger.video("train_openl", to_np(openl))
                 self._logger.write(fps=True)
 
-        policy_output, state = self._policy(obs, state, training)
+        with profiler.timer("policy_inference"):
+            policy_output, state = self._policy(obs, state, training)
 
         if training:
             self._step += len(reset)
@@ -171,16 +178,20 @@ class Dreamer(nn.Module):
         return policy_output, state
 
     def _train(self, data):
+        profiler = tools.get_profiler()
         metrics = {}
-        post, context, mets = self._wm._train(data)
+        with profiler.timer("train_world_model"):
+            post, context, mets = self._wm._train(data)
         metrics.update(mets)
         start = post
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.dynamics.get_feat(s)
         ).mode()
-        metrics.update(self._task_behavior._train(start, reward)[-1])
+        with profiler.timer("train_actor_critic"):
+            metrics.update(self._task_behavior._train(start, reward)[-1])
         if self._config.expl_behavior != "greedy":
-            mets = self._expl_behavior.train(start, context, data)[-1]
+            with profiler.timer("train_exploration"):
+                mets = self._expl_behavior.train(start, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
         for name, value in metrics.items():
             if not name in self._metrics.keys():
@@ -275,6 +286,20 @@ def main(config):
     logdir.mkdir(parents=True, exist_ok=True)
     config.traindir.mkdir(parents=True, exist_ok=True)
     config.evaldir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize profiler if enabled
+    profiler = None
+    if getattr(config, 'profile', False):
+        print("Profiling enabled.")
+        profiler = tools.enable_profiler(use_cuda_events=torch.cuda.is_available())
+
+        # Set up signal handler to print profiler summary on interrupt
+        def signal_handler(sig, frame):
+            print("\nInterrupted! Printing profiler summary...")
+            if profiler:
+                profiler.summary()
+            sys.exit(0)
+        signal.signal(signal.SIGINT, signal_handler)
 
     # Initialize wandb
     use_wandb = getattr(config, 'wandb', False) and WANDB_AVAILABLE
@@ -378,34 +403,42 @@ def main(config):
         if config.eval_episode_num > 0:
             print("Start evaluation.")
             eval_policy = functools.partial(agent, training=False)
-            tools.simulate(
-                eval_policy,
-                eval_envs,
-                eval_eps,
-                config.evaldir,
-                logger,
-                is_eval=True,
-                episodes=config.eval_episode_num,
-            )
+            with profiler.timer("eval_rollout") if profiler else nullcontext():
+                tools.simulate(
+                    eval_policy,
+                    eval_envs,
+                    eval_eps,
+                    config.evaldir,
+                    logger,
+                    is_eval=True,
+                    episodes=config.eval_episode_num,
+                )
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
                 logger.video("eval_openl", to_np(video_pred))
         print("Start training.")
-        state = tools.simulate(
-            agent,
-            train_envs,
-            train_eps,
-            config.traindir,
-            logger,
-            limit=config.dataset_size,
-            steps=config.eval_every,
-            state=state,
-        )
-        items_to_save = {
-            "agent_state_dict": agent.state_dict(),
-            "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
-        }
-        torch.save(items_to_save, logdir / "latest.pt")
+        with profiler.timer("train_rollout") if profiler else nullcontext():
+            state = tools.simulate(
+                agent,
+                train_envs,
+                train_eps,
+                config.traindir,
+                logger,
+                limit=config.dataset_size,
+                steps=config.eval_every,
+                state=state,
+            )
+        with profiler.timer("io_save_checkpoint") if profiler else nullcontext():
+            items_to_save = {
+                "agent_state_dict": agent.state_dict(),
+                "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+            }
+            torch.save(items_to_save, logdir / "latest.pt")
+
+        # Print intermediate profiler summary every eval cycle
+        if profiler:
+            profiler.summary()
+
     for env in train_envs + eval_envs:
         try:
             env.close()
@@ -414,6 +447,14 @@ def main(config):
 
     if use_wandb:
         wandb.finish()
+
+    # Print final profiler summary
+    if profiler:
+        print("\n" + "=" * 80)
+        print("FINAL PROFILER SUMMARY")
+        print("=" * 80)
+        profiler.summary()
+
     print("Training complete!")
 
 
@@ -425,6 +466,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="dreamerv3", help="Wandb project name")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity")
     parser.add_argument("--wandb_name", type=str, default=None, help="Wandb run name")
+    # Profiling argument
+    parser.add_argument("--profile", action="store_true", help="Enable performance profiling")
     args, remaining = parser.parse_known_args()
     yaml = yaml.YAML(typ="safe", pure=True)
     configs = yaml.load(
@@ -452,4 +495,6 @@ if __name__ == "__main__":
     final_args.wandb_project = args.wandb_project
     final_args.wandb_entity = args.wandb_entity
     final_args.wandb_name = args.wandb_name
+    # Add profiling arg to config
+    final_args.profile = args.profile
     main(final_args)
