@@ -265,6 +265,7 @@ if __name__ == "__main__":
         render_mode="rgb_array",
         sensor_configs=dict(width=img_size, height=img_size),  # 设置图像大小
     )
+    print(f'env control mode: {env.unwrapped.control_mode}')
     obs, info = env.reset()
     print_obs_structure(obs)
     
